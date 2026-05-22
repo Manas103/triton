@@ -361,6 +361,7 @@ json TreeData::buildHatchetJson(TreeData::Tree *tree,
         childrenArray = json::array();
         const bool hasLinkedTargets =
             !treeNode.metricSet.linkedMetrics.empty() ||
+            !treeNode.metricSet.linkedKernelMetrics.empty() ||
             !treeNode.metricSet.linkedFlexibleMetrics.empty();
         childrenArray.get_ref<json::array_t &>().reserve(
             treeNode.children.size() +
@@ -378,6 +379,8 @@ json TreeData::buildHatchetJson(TreeData::Tree *tree,
               const auto &virtualNode = virtualTree->getNode(virtualNodeId);
               const auto metricsIt =
                   treeNode.metricSet.linkedMetrics.find(virtualNodeId);
+              const auto kernelMetricIt =
+                  treeNode.metricSet.linkedKernelMetrics.find(virtualNodeId);
               const auto flexibleIt =
                   treeNode.metricSet.linkedFlexibleMetrics.find(virtualNodeId);
               outNode = json::object();
@@ -386,6 +389,11 @@ json TreeData::buildHatchetJson(TreeData::Tree *tree,
               outNode["metrics"] = json::object();
               if (metricsIt != treeNode.metricSet.linkedMetrics.end()) {
                 appendMetrics(outNode["metrics"], metricsIt->second);
+              }
+              if (kernelMetricIt !=
+                  treeNode.metricSet.linkedKernelMetrics.end()) {
+                appendKernelMetric(outNode["metrics"],
+                                   &kernelMetricIt->second);
               }
               // Linked flexible metrics are only attached to <metric_node>
               // children, so they always belong on the parent frame.
@@ -483,7 +491,6 @@ TreeData::buildHatchetMsgPack(TreeData::Tree *tree,
 
   MetricSummary metricSummary;
   metricSummary.hasKernelMetric = true;
-  const std::map<MetricKind, std::unique_ptr<Metric>> emptyMetrics;
   const auto &virtualRootNode = virtualTree->getNode(Tree::TreeNode::RootId);
 
   constexpr uint32_t kernelInclusiveCount = 2;
@@ -735,12 +742,58 @@ TreeData::buildHatchetMsgPack(TreeData::Tree *tree,
                                     treeNode.metricSet.linkedFlexibleMetrics);
         const bool hasLinkedTargets =
             !treeNode.metricSet.linkedMetrics.empty() ||
+            !treeNode.metricSet.linkedKernelMetrics.empty() ||
             !treeNode.metricSet.linkedFlexibleMetrics.empty();
 
-        auto getOnlyLinkedKernelMetric = [&](size_t virtualNodeId)
-            -> const KernelMetric * {
+        auto countLinkedMetricEntries = [&](size_t virtualNodeId) -> uint32_t {
+          uint32_t metricEntries = 0;
+          bool hasNestedKernelMetric = false;
           const auto metricsIt =
               treeNode.metricSet.linkedMetrics.find(virtualNodeId);
+          if (metricsIt != treeNode.metricSet.linkedMetrics.end()) {
+            metricEntries +=
+                countMetricEntries(metricsIt->second, /*isRoot=*/false);
+            hasNestedKernelMetric =
+                metricsIt->second.find(MetricKind::Kernel) !=
+                metricsIt->second.end();
+          }
+          if (!hasNestedKernelMetric &&
+              treeNode.metricSet.linkedKernelMetrics.find(virtualNodeId) !=
+                  treeNode.metricSet.linkedKernelMetrics.end()) {
+            metricEntries += kernelTotalCount;
+          }
+          return metricEntries;
+        };
+        auto packLinkedMetrics = [&](size_t virtualNodeId) {
+          bool hasNestedKernelMetric = false;
+          const auto metricsIt =
+              treeNode.metricSet.linkedMetrics.find(virtualNodeId);
+          if (metricsIt != treeNode.metricSet.linkedMetrics.end()) {
+            packMetrics(metricsIt->second, /*isRoot=*/false);
+            hasNestedKernelMetric =
+                metricsIt->second.find(MetricKind::Kernel) !=
+                metricsIt->second.end();
+          }
+          const auto kernelMetricIt =
+              treeNode.metricSet.linkedKernelMetrics.find(virtualNodeId);
+          if (!hasNestedKernelMetric &&
+              kernelMetricIt != treeNode.metricSet.linkedKernelMetrics.end()) {
+            packKernelMetricValues(&kernelMetricIt->second);
+          }
+        };
+        auto getOnlyLinkedKernelMetric =
+            [&](size_t virtualNodeId) -> const KernelMetric * {
+          const auto metricsIt =
+              treeNode.metricSet.linkedMetrics.find(virtualNodeId);
+          const auto kernelMetricIt =
+              treeNode.metricSet.linkedKernelMetrics.find(virtualNodeId);
+          if (kernelMetricIt != treeNode.metricSet.linkedKernelMetrics.end()) {
+            if (metricsIt != treeNode.metricSet.linkedMetrics.end() &&
+                !metricsIt->second.empty()) {
+              return nullptr;
+            }
+            return &kernelMetricIt->second;
+          }
           if (metricsIt == treeNode.metricSet.linkedMetrics.end() ||
               metricsIt->second.size() != 1 ||
               metricsIt->second.begin()->first != MetricKind::Kernel) {
@@ -753,11 +806,7 @@ TreeData::buildHatchetMsgPack(TreeData::Tree *tree,
         auto hasLinkedVirtualNode = [&](auto &&hasLinkedVirtualNode,
                                         size_t virtualNodeId) -> bool {
               const auto &virtualNode = virtualTree->getNode(virtualNodeId);
-              const auto metricsIt =
-                  treeNode.metricSet.linkedMetrics.find(virtualNodeId);
-              if (metricsIt != treeNode.metricSet.linkedMetrics.end() &&
-                  countMetricEntries(metricsIt->second, /*isRoot=*/false) >
-                      0) {
+              if (countLinkedMetricEntries(virtualNodeId) > 0) {
                 return true;
               }
               if (countPromotedFlexibleMetricEntries(
@@ -793,6 +842,11 @@ TreeData::buildHatchetMsgPack(TreeData::Tree *tree,
               }
               if (treeNode.metricSet.linkedMetrics.find(virtualNode.id) !=
                   treeNode.metricSet.linkedMetrics.end()) {
+                return false;
+              }
+              if (treeNode.metricSet.linkedKernelMetrics.find(
+                      virtualNode.id) !=
+                  treeNode.metricSet.linkedKernelMetrics.end()) {
                 return false;
               }
               return countPromotedFlexibleMetricEntries(
@@ -941,18 +995,12 @@ TreeData::buildHatchetMsgPack(TreeData::Tree *tree,
               writer.packFixStrLiteral("function");
 
               writer.packFixStrLiteral("metrics");
-              const auto metricsIt =
-                  treeNode.metricSet.linkedMetrics.find(virtualNodeId);
-              const auto &linkedMetrics =
-                  (metricsIt != treeNode.metricSet.linkedMetrics.end())
-                      ? metricsIt->second
-                      : emptyMetrics;
               writer.packMap(
-                  countMetricEntries(linkedMetrics, /*isRoot=*/false) +
+                  countLinkedMetricEntries(virtualNodeId) +
                   countPromotedFlexibleMetricEntries(
                       virtualNode.children,
                       treeNode.metricSet.linkedFlexibleMetrics));
-              packMetrics(linkedMetrics, /*isRoot=*/false);
+              packLinkedMetrics(virtualNodeId);
               // Linked flexible metrics are only attached to <metric_node>
               // children, so they are always packed into the parent frame.
               packPromotedFlexibleMetrics(
